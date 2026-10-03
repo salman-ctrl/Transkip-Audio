@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transkrip Audio</title>
+<style>
+  :root { --bg:#f6f5f1; --card:#fff; --text:#1c1b19; --muted:#6b6860; --line:#dedbd2; --accent:#1f6f5c; --accent-text:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161614; --card:#201f1c; --text:#eceae4; --muted:#9a968c; --line:#35332e; --accent:#4fb89c; --accent-text:#10201b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:28px; margin:0 0 4px; letter-spacing:-0.02em; }
+  p.sub { margin:0 0 24px; color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  #drop { border:2px dashed var(--line); border-radius:10px; padding:28px 16px; text-align:center; cursor:pointer; color:var(--muted); }
+  #drop.over { border-color:var(--accent); color:var(--text); }
+  #drop strong { color:var(--text); display:block; margin-bottom:4px; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-top:16px; }
+  label { font-size:13px; color:var(--muted); display:block; margin-bottom:4px; }
+  select, button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:var(--accent-text); border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .grow { flex:1 1 180px; }
+  .grow select { width:100%; }
+  audio { width:100%; margin-top:16px; display:none; }
+  #status { font-size:14px; color:var(--muted); margin-top:14px; min-height:22px; }
+  progress { width:100%; height:8px; margin-top:8px; display:none; accent-color:var(--accent); }
+  #out { white-space:pre-wrap; min-height:160px; font-size:16px; outline:none; }
+  #out:empty::before { content:"Hasil transkrip muncul di sini."; color:var(--muted); }
+  .tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }
+  .tools label { margin:0 auto 0 0; font-size:14px; display:flex; gap:6px; align-items:center; color:var(--text); }
+  .note { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Transkrip Audio</h1>
+  <p class="sub">Audio ke teks pakai Whisper, jalan di browser kamu sendiri. Gratis, file tidak diupload ke mana pun.</p>
+
+  <div class="card">
+    <div id="drop" tabindex="0">
+      <strong id="fname">Klik atau tarik file audio ke sini</strong>
+      <span>mp3, wav, m4a, ogg, atau video mp4</span>
+    </div>
+    <input id="file" type="file" accept="audio/*,video/*" hidden>
+    <audio id="player" controls></audio>
+
+    <div class="row">
+      <div class="grow">
+        <label for="model">Model</label>
+        <select id="model">
+          <option value="Xenova/whisper-tiny.en">Inggris, cepat (tiny, ~40 MB)</option>
+          <option value="Xenova/whisper-base.en" selected>Inggris, seimbang (base, ~80 MB)</option>
+          <option value="Xenova/whisper-small.en">Inggris, paling akurat (small, ~250 MB)</option>
+          <option value="Xenova/whisper-base">Multibahasa (base, ~80 MB)</option>
+          <option value="Xenova/whisper-small">Multibahasa, akurat (small, ~250 MB)</option>
+        </select>
+      </div>
+      <div class="grow" id="langWrap" style="display:none">
+        <label for="lang">Bahasa audio</label>
+        <select id="lang">
+          <option value="indonesian">Indonesia</option>
+          <option value="english">Inggris</option>
+          <option value="">Deteksi otomatis</option>
+        </select>
+      </div>
+      <button id="go" class="primary" disabled>Transkrip</button>
+    </div>
+    <div id="status"></div>
+    <progress id="bar" max="100" value="0"></progress>
+  </div>
+
+  <div class="card">
+    <div class="tools">
+      <label><input type="checkbox" id="ts"> Tampilkan waktu</label>
+      <button id="copy" disabled>Salin</button>
+      <button id="save" disabled>Unduh .txt</button>
+    </div>
+    <div id="out" contenteditable="true" spellcheck="false"></div>
+  </div>
+
+  <p class="note">Pertama kali pakai sebuah model, browser mengunduhnya dulu (butuh internet), setelah itu tersimpan di cache. Paling lancar di Chrome atau Edge.</p>
+</main>
+
+<script>
+const WORKER_SRC = [
+  'import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3";',
+  'let asr = null, loaded = null;',
+  'self.onmessage = async (e) => {',
+  '  const { audio, model, language } = e.data;',
+  '  try {',
+  '    if (loaded !== model) {',
+  '      asr = await pipeline("automatic-speech-recognition", model, {',
+  '        dtype: "q8",',
+  '        progress_callback: (p) => self.postMessage({ type: "dl", p }),',
+  '      });',
+  '      loaded = model;',
+  '    }',
+  '    self.postMessage({ type: "run" });',
+  '    const opts = { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true };',
+  '    if (!model.endsWith(".en")) { opts.task = "transcribe"; if (language) opts.language = language; }',
+  '    const res = await asr(audio, opts);',
+  '    self.postMessage({ type: "done", res });',
+  '  } catch (err) {',
+  '    self.postMessage({ type: "err", msg: String(err && err.message || err) });',
+  '  }',
+  '};'
+].join('\n');
+
+const $ = (id) => document.getElementById(id);
+const drop = $('drop'), fileIn = $('file'), go = $('go'), statusEl = $('status'), bar = $('bar');
+const out = $('out'), modelSel = $('model'), langWrap = $('langWrap');
+let file = null, worker = null, result = null, timer = null;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function pick(f) {
+  if (!f) return;
+  file = f;
+  $('fname').textContent = f.name;
+  const p = $('player');
+  p.src = URL.createObjectURL(f);
+  p.style.display = 'block';
+  go.disabled = false;
+  setStatus('');
+}
+
+drop.onclick = () => fileIn.click();
+drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') fileIn.click(); };
+fileIn.onchange = () => pick(fileIn.files[0]);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); pick(e.dataTransfer.files[0]); };
+
+modelSel.onchange = () => { langWrap.style.display = modelSel.value.endsWith('.en') ? 'none' : ''; };
+
+// Decode file apa pun jadi mono 16 kHz, format yang diminta Whisper
+async function decode(f) {
+  const buf = await f.arrayBuffer();
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  const ab = await ctx.decodeAudioData(buf);
+  ctx.close();
+  if (ab.numberOfChannels === 1) return ab.getChannelData(0);
+  const a = ab.getChannelData(0), b = ab.getChannelData(1), m = new Float32Array(a.length);
+  for (let i = 0; i < a.length; i++) m[i] = (a[i] + b[i]) / 2;
+  return m;
+}
+
+function fmt(s) {
+  if (s == null) return '--:--';
+  const m = Math.floor(s / 60), r = Math.floor(s % 60);
+  return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+}
+
+function render() {
+  if (!result) return;
+  if ($('ts').checked && result.chunks && result.chunks.length) {
+    out.textContent = result.chunks.map(c => '[' + fmt(c.timestamp[0]) + '] ' + c.text.trim()).join('\n');
+  } else {
+    out.textContent = (result.text || '').trim();
+  }
+}
+$('ts').onchange = render;
+
+function finish() {
+  clearInterval(timer);
+  bar.style.display = 'none';
+  go.disabled = false;
+}
+
+go.onclick = async () => {
+  if (!file) return;
+  go.disabled = true;
+  result = null;
+  out.textContent = '';
+  $('copy').disabled = $('save').disabled = true;
+  try {
+    setStatus('Membaca audio...');
+    const audio = await decode(file);
+    const dur = audio.length / 16000;
+
+    if (!worker) {
+      worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+      worker.onerror = (e) => { finish(); setStatus('Gagal memuat library: ' + (e.message || 'cek koneksi internet') ); };
+      worker.onmessage = (e) => {
+        const d = e.data;
+        if (d.type === 'dl') {
+          if (d.p.status === 'progress' && d.p.file && d.p.file.endsWith('.onnx')) {
+            bar.style.display = 'block';
+            bar.value = d.p.progress || 0;
+            setStatus('Mengunduh model... ' + Math.round(d.p.progress || 0) + '%');
+          }
+        } else if (d.type === 'run') {
+          bar.style.display = 'none';
+          const t0 = Date.now();
+          timer = setInterval(() => setStatus('Mentranskrip audio ' + fmt(worker._dur) + '... sudah ' + Math.round((Date.now() - t0) / 1000) + ' detik'), 500);
+        } else if (d.type === 'done') {
+          finish();
+          result = d.res;
+          render();
+          $('copy').disabled = $('save').disabled = false;
+          setStatus('Selesai.');
+        } else if (d.type === 'err') {
+          finish();
+          setStatus('Error: ' + d.msg);
+        }
+      };
+    }
+    worker._dur = dur;
+    setStatus('Menyiapkan model...');
+    worker.postMessage({ audio, model: modelSel.value, language: $('lang').value }, [audio.buffer]);
+  } catch (err) {
+    finish();
+    setStatus('Gagal membaca file audio: ' + (err.message || err));
+  }
+};
+
+$('copy').onclick = async () => {
+  await navigator.clipboard.writeText(out.textContent);
+  $('copy').textContent = 'Tersalin';
+  setTimeout(() => $('copy').textContent = 'Salin', 1200);
+};
+$('save').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([out.textContent], { type: 'text/plain' }));
+  a.download = (file ? file.name.replace(/\.[^.]+$/, '') : 'transkrip') + '.txt';
+  a.click();
+};
+</script>
+</body>
+</html>
